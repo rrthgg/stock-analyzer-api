@@ -1,58 +1,36 @@
-"""
-Stock Analyzer API - Backend FastAPI
-Déployable sur Render.com ou Railway.app (gratuit)
-Données via yfinance (Yahoo Finance, délai ~15 min)
-"""
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import yfinance as yf
+import requests
 import math
+import os
 
-app = FastAPI(title="Stock Analyzer API", version="1.0.0")
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# CORS : autorise tous les domaines (à restreindre en production)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=False,
-)
+AV_KEY = os.environ.get("AV_KEY", "VOTRE_CLE_ICI")
+BASE   = "https://www.alphavantage.co/query"
 
-def safe(v, default=None):
-    """Retourne None si la valeur est NaN ou infinie."""
-    if v is None:
-        return default
+def safe(v):
+    if v is None or v == "None" or v == "-" or v == "":
+        return None
     try:
-        if math.isnan(v) or math.isinf(v):
-            return default
-    except (TypeError, ValueError):
-        pass
-    return v
+        f = float(v)
+        return None if math.isnan(f) or math.isinf(f) else f
+    except Exception:
+        return None
 
 def pct(v):
-    """Convertit un ratio décimal en pourcentage."""
-    if v is None:
-        return None
-    try:
-        if math.isnan(v):
-            return None
-        return round(v * 100, 2)
-    except (TypeError, ValueError):
-        return None
+    f = safe(v)
+    return round(f * 100, 2) if f is not None else None
 
-def consensus_label(key):
-    """Traduit la clé de recommandation Yahoo en label français."""
-    mapping = {
-        "strongBuy": "Strong Buy",
-        "buy": "Buy",
-        "hold": "Hold",
-        "sell": "Reduce",
-        "strongSell": "Reduce",
-    }
-    return mapping.get(str(key).lower(), "Hold") if key else "Hold"
+def consensus_label(score):
+    if score is None: return "Hold"
+    s = float(score)
+    if s <= 1.5: return "Strong Buy"
+    if s <= 2.5: return "Buy"
+    if s <= 3.5: return "Hold"
+    return "Reduce"
 
 @app.get("/")
 def root():
@@ -62,144 +40,165 @@ def root():
 def get_stock(ticker: str):
     ticker = ticker.upper().strip()
     try:
-        t = yf.Ticker(ticker)
-        info = t.info
+        # Cours + métadonnées
+        r1 = requests.get(BASE, params={
+            "function": "GLOBAL_QUOTE",
+            "symbol": ticker,
+            "apikey": AV_KEY
+        }, timeout=15)
+        d1 = r1.json()
+        q  = d1.get("Global Quote", {})
+        if not q or not q.get("05. price"):
+            raise HTTPException(status_code=404, detail=f"Ticker '{ticker}' introuvable. Vérifiez le symbole (ex: AAPL, MC.PAR, SAP.FRK).")
 
-        if not info or len(info) < 5:
-            raise HTTPException(status_code=404, detail=f"Ticker '{ticker}' introuvable. Vérifiez le suffixe (ex: SAP.DE, MC.PA, ASML.AS)")
+        price = safe(q.get("05. price"))
+        hi52  = safe(q.get("03. high"))
+        lo52  = safe(q.get("04. low"))
 
-        price = safe(info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"))
+        # Informations société
+        r2 = requests.get(BASE, params={
+            "function": "OVERVIEW",
+            "symbol": ticker,
+            "apikey": AV_KEY
+        }, timeout=15)
+        ov = r2.json()
 
-        if not price:
-            raise HTTPException(status_code=404, detail=f"Aucun cours disponible pour '{ticker}'.")
+        name     = ov.get("Name", ticker)
+        sector   = ov.get("Sector", "—")
+        industry = ov.get("Industry", "—")
+        country  = ov.get("Country", "—")
+        currency = ov.get("Currency", "USD")
+        exchange = ov.get("Exchange", "—")
+        summary  = (ov.get("Description") or "")[:400]
 
-        tgt   = safe(info.get("targetMeanPrice"))
-        tgt_h = safe(info.get("targetHighPrice"))
-        tgt_l = safe(info.get("targetLowPrice"))
+        pe          = safe(ov.get("TrailingPE"))
+        forward_pe  = safe(ov.get("ForwardPE"))
+        pb          = safe(ov.get("PriceToBookRatio"))
+        ps          = safe(ov.get("PriceToSalesRatioTTM"))
+        ev_ebitda   = safe(ov.get("EVToEBITDA"))
+        peg         = safe(ov.get("PEGRatio"))
+        market_cap  = safe(ov.get("MarketCapitalization"))
+        beta        = safe(ov.get("Beta"))
+        div_rate    = safe(ov.get("DividendPerShare"))
+        div_yield   = safe(ov.get("DividendYield"))
+        payout      = safe(ov.get("PayoutRatio"))
+        roe         = pct(ov.get("ReturnOnEquityTTM"))
+        roa         = pct(ov.get("ReturnOnAssetsTTM"))
+        net_margin  = pct(ov.get("ProfitMargin"))
+        op_margin   = pct(ov.get("OperatingMarginTTM"))
+        rev_growth  = pct(ov.get("QuarterlyRevenueGrowthYOY"))
+        eps_growth  = pct(ov.get("QuarterlyEarningsGrowthYOY"))
+        debt_eq     = safe(ov.get("DebtToEquityRatio") or ov.get("BookValue"))
+        tgt         = safe(ov.get("AnalystTargetPrice"))
+        insider     = pct(ov.get("PercentInsiders"))
+        institution = pct(ov.get("PercentInstitutions"))
+        hi52_ov     = safe(ov.get("52WeekHigh"))
+        lo52_ov     = safe(ov.get("52WeekLow"))
+        analyst_n   = safe(ov.get("AnalystRatingStrongBuy"))
 
-        upside = None
-        if price and tgt and price > 0:
-            upside = round((tgt / price - 1) * 100, 2)
+        # Consensus approximatif
+        sb  = safe(ov.get("AnalystRatingStrongBuy"))  or 0
+        b   = safe(ov.get("AnalystRatingBuy"))        or 0
+        h   = safe(ov.get("AnalystRatingHold"))       or 0
+        s   = safe(ov.get("AnalystRatingSell"))        or 0
+        ss  = safe(ov.get("AnalystRatingStrongSell")) or 0
+        total_ana = sb + b + h + s + ss
+        cons_note = "Hold"
+        num_ana   = int(total_ana) if total_ana else None
+        if total_ana > 0:
+            score = (sb*1 + b*2 + h*3 + s*4 + ss*5) / total_ana
+            cons_note = consensus_label(score)
 
-        hist = None
-        ma200 = ma50 = None
-        try:
-            hist = t.history(period="1y")
-        except Exception:
-            hist = None
+        upside = round((tgt / price - 1) * 100, 2) if tgt and price and price > 0 else None
 
-        if hist is not None and not hist.empty and "Close" in hist.columns:
-            closes = hist["Close"]
-            if len(closes) >= 200:
-                ma200 = round(float(closes.tail(200).mean()), 2)
-            elif len(closes) >= 2:
-                ma200 = round(float(closes.mean()), 2)
-            if len(closes) >= 50:
-                ma50 = round(float(closes.tail(50).mean()), 2)
-            elif len(closes) >= 2:
-                ma50 = round(float(closes.mean()), 2)
+        # Historique 200 jours pour MM
+        r3 = requests.get(BASE, params={
+            "function": "TIME_SERIES_DAILY",
+            "symbol": ticker,
+            "outputsize": "compact",
+            "apikey": AV_KEY
+        }, timeout=15)
+        d3     = r3.json()
+        series = d3.get("Time Series (Daily)", {})
+        closes = [float(v["4. close"]) for v in list(series.values())[:200]]
 
+        ma200 = round(sum(closes) / len(closes), 2)       if len(closes) >= 100 else None
+        ma50  = round(sum(closes[:50]) / 50, 2)           if len(closes) >= 50  else None
         ma200_signal = 1 if (price and ma200 and price > ma200) else -1
         ma50_signal  = 1 if (price and ma50  and price > ma50)  else -1
 
         rsi = None
-        try:
-            if hist is not None and not hist.empty and len(hist) >= 15:
-                delta = hist["Close"].diff()
-                gains  = delta.clip(lower=0).tail(14)
-                losses = (-delta.clip(upper=0)).tail(14)
-                avg_gain = gains.mean()
-                avg_loss = losses.mean()
-                if avg_loss and avg_loss != 0:
-                    rs = avg_gain / avg_loss
-                    rsi = round(100 - (100 / (1 + rs)), 1)
-        except Exception:
-            rsi = None
+        if len(closes) >= 15:
+            deltas = [closes[i] - closes[i+1] for i in range(14)]
+            gains  = [d if d > 0 else 0 for d in deltas]
+            losses = [-d if d < 0 else 0 for d in deltas]
+            avg_g  = sum(gains) / 14
+            avg_l  = sum(losses) / 14
+            if avg_l > 0:
+                rsi = round(100 - 100 / (1 + avg_g / avg_l), 1)
 
-        cons_note = consensus_label(info.get("recommendationKey"))
+        fcf_yield = None
+        if market_cap and market_cap > 0:
+            fcf_raw = safe(ov.get("OperatingCashflowTTM"))
+            capex   = safe(ov.get("CapitalExpenditures"))
+            if fcf_raw and capex:
+                fcf = fcf_raw - abs(capex)
+                fcf_yield = round(fcf / market_cap * 100, 2)
 
-        result = {
-            "ticker":    ticker,
-            "name":      info.get("longName") or info.get("shortName", ticker),
-            "sector":    info.get("sector") or info.get("quoteType", "—"),
-            "industry":  info.get("industry", "—"),
-            "country":   info.get("country", "—"),
-            "currency":  info.get("currency", "USD"),
-            "exchange":  info.get("exchange", "—"),
-            "website":   info.get("website"),
-            "summary":   (info.get("longBusinessSummary") or "")[:400],
-
-            "price":        round(price, 2) if price else None,
-            "price52wHigh": safe(info.get("fiftyTwoWeekHigh")),
-            "price52wLow":  safe(info.get("fiftyTwoWeekLow")),
-            "targetMean":   round(tgt, 2) if tgt else None,
-            "targetHigh":   round(tgt_h, 2) if tgt_h else None,
-            "targetLow":    round(tgt_l, 2) if tgt_l else None,
-            "upside":       upside,
-
-            "pe":          safe(info.get("trailingPE")),
-            "forwardPE":   safe(info.get("forwardPE")),
-            "pb":          safe(info.get("priceToBook")),
-            "ps":          safe(info.get("priceToSalesTrailing12Months")),
-            "evEbitda":    safe(info.get("enterpriseToEbitda")),
-            "evRevenue":   safe(info.get("enterpriseToRevenue")),
-            "peg":         safe(info.get("pegRatio")),
-            "marketCap":   safe(info.get("marketCap")),
-
-            "roe":         pct(info.get("returnOnEquity")),
-            "roa":         pct(info.get("returnOnAssets")),
-            "netMargin":   pct(info.get("profitMargins")),
-            "grossMargin": pct(info.get("grossMargins")),
-            "opMargin":    pct(info.get("operatingMargins")),
-            "revGrowth":   pct(info.get("revenueGrowth")),
-            "epsGrowth":   pct(info.get("earningsGrowth")),
-            "fcfYield":    pct(info.get("freeCashflow") / info.get("marketCap"))
-                           if info.get("freeCashflow") and info.get("marketCap") else None,
-
-            "debtEquity":   safe(info.get("debtToEquity")),
-            "currentRatio": safe(info.get("currentRatio")),
-            "cashPerShare": safe(info.get("totalCashPerShare")),
-
-            "dividendRate":   safe(info.get("dividendRate")),
-            "dividendYield":  pct(info.get("dividendYield")),
-            "payoutRatio":    pct(info.get("payoutRatio")),
-
-            "beta":         safe(info.get("beta")),
-            "rsi":          rsi,
-            "ma200":        ma200,
-            "ma50":         ma50,
-            "ma200Signal":  ma200_signal,
-            "ma50Signal":   ma50_signal,
-            "avgVolume":    safe(info.get("averageVolume")),
-            "shortRatio":   safe(info.get("shortRatio")),
-
+        return JSONResponse(content={
+            "ticker":               ticker,
+            "name":                 name,
+            "sector":               sector,
+            "industry":             industry,
+            "country":              country,
+            "currency":             currency,
+            "exchange":             exchange,
+            "summary":              summary,
+            "price":                round(price, 2) if price else None,
+            "price52wHigh":         hi52_ov or hi52,
+            "price52wLow":          lo52_ov or lo52,
+            "targetMean":           tgt,
+            "targetHigh":           None,
+            "targetLow":            None,
+            "upside":               upside,
+            "pe":                   pe,
+            "forwardPE":            forward_pe,
+            "pb":                   pb,
+            "ps":                   ps,
+            "evEbitda":             ev_ebitda,
+            "peg":                  peg,
+            "marketCap":            market_cap,
+            "roe":                  roe,
+            "roa":                  roa,
+            "netMargin":            net_margin,
+            "grossMargin":          None,
+            "opMargin":             op_margin,
+            "revGrowth":            rev_growth,
+            "epsGrowth":            eps_growth,
+            "fcfYield":             fcf_yield,
+            "debtEquity":           debt_eq,
+            "currentRatio":         None,
+            "cashPerShare":         None,
+            "dividendRate":         div_rate,
+            "dividendYield":        round(float(div_yield)*100, 2) if div_yield else None,
+            "payoutRatio":          round(float(payout)*100, 2) if payout else None,
+            "beta":                 beta,
+            "rsi":                  rsi,
+            "ma200":                ma200,
+            "ma50":                 ma50,
+            "ma200Signal":          ma200_signal,
+            "ma50Signal":           ma50_signal,
+            "avgVolume":            None,
+            "shortRatio":           None,
             "consensusNote":        cons_note,
-            "numAnalysts":          safe(info.get("numberOfAnalystOpinions")),
-            "recommendationKey":    info.get("recommendationKey", "hold"),
-
-            "insiderOwnership":     pct(info.get("heldPercentInsiders")),
-            "institutionOwnership": pct(info.get("heldPercentInstitutions")),
-
-            "peers": [],
-        }
-
-        return JSONResponse(content=result)
+            "numAnalysts":          num_ana,
+            "recommendationKey":    cons_note.lower().replace(" ", ""),
+            "insiderOwnership":     insider,
+            "institutionOwnership": institution,
+            "peers":                [],
+        })
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des données : {str(e)}")
-
-
-@app.get("/search/{query}")
-def search_ticker(query: str):
-    """Recherche approximative de tickers (basique — utilise yfinance)."""
-    try:
-        results = yf.Search(query, max_results=8)
-        quotes = results.quotes if hasattr(results, "quotes") else []
-        return {"results": [
-            {"ticker": q.get("symbol"), "name": q.get("longname") or q.get("shortname"), "exchange": q.get("exchange")}
-            for q in quotes if q.get("symbol")
-        ]}
-    except Exception as e:
-        return {"results": [], "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Erreur : {str(e)}")
