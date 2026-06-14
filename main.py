@@ -1,7 +1,6 @@
 """
-Stock Analyzer API — Alpha Vantage (cours) + FMP (fondamentaux)
-Alpha Vantage : cours temps réel, RSI, moyennes mobiles
-FMP           : PER, marges, ROE, consensus analystes, objectif de cours
+Stock Analyzer API — Alpha Vantage (cours) + FMP v4 (fondamentaux)
+Endpoints FMP mis à jour post-août 2025
 """
 
 from fastapi import FastAPI, HTTPException
@@ -19,19 +18,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-AV_KEY  = os.environ.get("AV_KEY",  "VOTRE_CLE_ALPHAVANTAGE")
-FMP_KEY = os.environ.get("FMP_KEY", "VOTRE_CLE_FMP")
+AV_KEY  = os.environ.get("AV_KEY",  "")
+FMP_KEY = os.environ.get("FMP_KEY", "")
 
 AV_BASE  = "https://www.alphavantage.co/query"
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_BASE = "https://financialmodelingprep.com/stable"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
-    "Accept": "application/json",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)"}
 
 def safe(v, default=None):
-    if v is None or v == "None" or v == "-" or v == "" or v == "N/A":
+    if v is None or v == "" or v == "N/A" or v == "-":
         return default
     try:
         f = float(v)
@@ -43,7 +39,7 @@ def pct(v):
     f = safe(v)
     return round(f * 100, 2) if f is not None else None
 
-def consensus_from_score(score):
+def consensus_label(score):
     if score is None: return "Hold"
     s = float(score)
     if s <= 1.5: return "Strong Buy"
@@ -51,13 +47,22 @@ def consensus_from_score(score):
     if s <= 3.5: return "Hold"
     return "Reduce"
 
-def consensus_from_fmp(label):
-    if not label: return "Hold"
-    l = label.lower()
-    if "strong buy" in l or "strongbuy" in l: return "Strong Buy"
-    if "buy" in l:                             return "Buy"
-    if "hold" in l or "neutral" in l:          return "Hold"
-    return "Reduce"
+def fmp_get(path, params={}):
+    """Appel FMP avec gestion d'erreur."""
+    try:
+        r = requests.get(
+            f"{FMP_BASE}/{path}",
+            params={"apikey": FMP_KEY, **params},
+            headers=HEADERS, timeout=15
+        )
+        data = r.json()
+        if isinstance(data, dict) and "Error Message" in data:
+            return None
+        if isinstance(data, dict) and "message" in data:
+            return None
+        return data
+    except Exception:
+        return None
 
 @app.get("/")
 def root():
@@ -67,230 +72,158 @@ def root():
 def get_stock(ticker: str):
     ticker = ticker.upper().strip()
 
-    # ─────────────────────────────────────────────
-    # 1. COURS — Alpha Vantage (fiable, pas de blocage)
-    # ─────────────────────────────────────────────
+    # ── 1. COURS — Alpha Vantage ──────────────────
     try:
-        r_quote = requests.get(AV_BASE, params={
+        r_q = requests.get(AV_BASE, params={
             "function": "GLOBAL_QUOTE",
             "symbol":   ticker,
             "apikey":   AV_KEY,
         }, headers=HEADERS, timeout=15)
-        q = r_quote.json().get("Global Quote", {})
+        q = r_q.json().get("Global Quote", {})
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Erreur Alpha Vantage : {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Erreur réseau : {str(e)}")
 
     price = safe(q.get("05. price"))
     if not price:
         raise HTTPException(
             status_code=404,
-            detail=f"Ticker '{ticker}' introuvable sur Alpha Vantage. "
-                   f"Pour les actions EU utilisez : MC.PAR, AIR.PAR, ASML.AMS, SAP.FRK, TTE.PAR, BNP.PAR"
+            detail=f"'{ticker}' introuvable. EU : MC.PAR, AIR.PAR, ASML.AMS, SAP.FRK, TTE.PAR"
         )
 
     hi52_av = safe(q.get("03. high"))
     lo52_av = safe(q.get("04. low"))
 
-    # ─────────────────────────────────────────────
-    # 2. HISTORIQUE — Alpha Vantage (MM50, MM200, RSI)
-    # ─────────────────────────────────────────────
+    # ── 2. HISTORIQUE — Alpha Vantage (MM + RSI) ──
     closes = []
     try:
-        r_hist = requests.get(AV_BASE, params={
+        r_h = requests.get(AV_BASE, params={
             "function":   "TIME_SERIES_DAILY",
             "symbol":     ticker,
             "outputsize": "compact",
             "apikey":     AV_KEY,
         }, headers=HEADERS, timeout=15)
-        series = r_hist.json().get("Time Series (Daily)", {})
+        series = r_h.json().get("Time Series (Daily)", {})
         closes = [float(v["4. close"]) for v in list(series.values())[:200]]
     except Exception:
         closes = []
 
-    ma200 = round(sum(closes) / len(closes), 2)        if len(closes) >= 100 else None
-    ma50  = round(sum(closes[:50]) / 50, 2)            if len(closes) >= 50  else None
+    ma200 = round(sum(closes)/len(closes), 2)     if len(closes) >= 100 else None
+    ma50  = round(sum(closes[:50])/50, 2)          if len(closes) >= 50  else None
     ma200_signal = 1 if (price and ma200 and price > ma200) else -1
     ma50_signal  = 1 if (price and ma50  and price > ma50)  else -1
 
     rsi = None
     if len(closes) >= 15:
         try:
-            deltas = [closes[i] - closes[i+1] for i in range(14)]
-            gains  = [d if d > 0 else 0 for d in deltas]
-            losses = [-d if d < 0 else 0 for d in deltas]
-            avg_g  = sum(gains) / 14
-            avg_l  = sum(losses) / 14
-            if avg_l > 0:
-                rsi = round(100 - 100 / (1 + avg_g / avg_l), 1)
+            deltas = [closes[i]-closes[i+1] for i in range(14)]
+            gains  = [d if d>0 else 0 for d in deltas]
+            losses = [-d if d<0 else 0 for d in deltas]
+            ag, al = sum(gains)/14, sum(losses)/14
+            if al > 0:
+                rsi = round(100 - 100/(1 + ag/al), 1)
         except Exception:
             rsi = None
 
-    # ─────────────────────────────────────────────
-    # 3. PROFIL SOCIÉTÉ — FMP
-    # ─────────────────────────────────────────────
-    name = ticker; sector = "—"; industry = "—"; country = "—"
-    currency = "USD"; exchange = "—"; summary = ""; website = None
-    market_cap = None; beta_fmp = None
-    hi52 = hi52_av; lo52 = lo52_av
+    # ── 3. PROFIL — FMP stable endpoint ───────────
+    name=ticker; sector="—"; industry="—"; country="—"
+    currency="USD"; exchange="—"; summary=""; website=None
+    market_cap=None; beta=None; hi52=hi52_av; lo52=lo52_av
 
-    try:
-        r_profile = requests.get(
-            f"{FMP_BASE}/profile/{ticker}",
-            params={"apikey": FMP_KEY},
-            headers=HEADERS, timeout=15
-        )
-        profiles = r_profile.json()
-        if profiles and isinstance(profiles, list) and len(profiles) > 0:
-            p = profiles[0]
-            name       = p.get("companyName", ticker)
-            sector     = p.get("sector", "—") or "—"
-            industry   = p.get("industry", "—") or "—"
-            country    = p.get("country", "—") or "—"
-            currency   = p.get("currency", "USD") or "USD"
-            exchange   = p.get("exchangeShortName", "—") or "—"
-            summary    = (p.get("description") or "")[:400]
-            website    = p.get("website")
-            market_cap = safe(p.get("mktCap"))
-            beta_fmp   = safe(p.get("beta"))
-            hi52       = safe(p.get("range", "").split("-")[1]) if p.get("range") and "-" in str(p.get("range")) else hi52_av
-            lo52       = safe(p.get("range", "").split("-")[0]) if p.get("range") and "-" in str(p.get("range")) else lo52_av
-    except Exception:
-        pass
+    profile = fmp_get(f"profile/{ticker}")
+    if profile and isinstance(profile, list) and len(profile) > 0:
+        p = profile[0]
+        name       = p.get("companyName") or ticker
+        sector     = p.get("sector")   or "—"
+        industry   = p.get("industry") or "—"
+        country    = p.get("country")  or "—"
+        currency   = p.get("currency") or "USD"
+        exchange   = p.get("exchangeShortName") or "—"
+        summary    = (p.get("description") or "")[:400]
+        website    = p.get("website")
+        market_cap = safe(p.get("mktCap"))
+        beta       = safe(p.get("beta"))
+        price_fmp  = safe(p.get("price"))
+        if price_fmp and not price:
+            price = price_fmp
+        rng = str(p.get("range") or "")
+        if "-" in rng:
+            parts = rng.split("-")
+            lo52 = safe(parts[0]) or lo52_av
+            hi52 = safe(parts[-1]) or hi52_av
 
-    # ─────────────────────────────────────────────
-    # 4. RATIOS FINANCIERS — FMP
-    # ─────────────────────────────────────────────
-    pe = forward_pe = pb = ps = ev_ebitda = peg = None
-    roe = roa = net_margin = gross_margin = op_margin = None
-    rev_growth = eps_growth = debt_eq = current_ratio = fcf_yield = None
-    div_rate = div_yield = payout = None
-    insider = institution = None
+    # ── 4. RATIOS — FMP stable ────────────────────
+    pe=pb=ps=ev_ebitda=peg=forward_pe=None
+    roe=roa=net_margin=gross_margin=op_margin=None
+    rev_growth=eps_growth=debt_eq=current_ratio=None
+    div_rate=div_yield=payout=fcf_yield=None
+    insider=institution=None
 
-    try:
-        r_ratios = requests.get(
-            f"{FMP_BASE}/ratios-ttm/{ticker}",
-            params={"apikey": FMP_KEY},
-            headers=HEADERS, timeout=15
-        )
-        ratios_data = r_ratios.json()
-        if ratios_data and isinstance(ratios_data, list):
-            r = ratios_data[0]
-            pe            = safe(r.get("peRatioTTM"))
-            pb            = safe(r.get("priceToBookRatioTTM"))
-            ps            = safe(r.get("priceToSalesRatioTTM"))
-            ev_ebitda     = safe(r.get("enterpriseValueOverEBITDATTM"))
-            peg           = safe(r.get("priceEarningsToGrowthRatioTTM"))
-            roe           = round(safe(r.get("returnOnEquityTTM"), 0) * 100, 2)
-            roa           = round(safe(r.get("returnOnAssetsTTM"), 0) * 100, 2)
-            net_margin    = round(safe(r.get("netProfitMarginTTM"), 0) * 100, 2)
-            gross_margin  = round(safe(r.get("grossProfitMarginTTM"), 0) * 100, 2)
-            op_margin     = round(safe(r.get("operatingProfitMarginTTM"), 0) * 100, 2)
-            debt_eq       = safe(r.get("debtEquityRatioTTM"))
-            current_ratio = safe(r.get("currentRatioTTM"))
-            div_yield     = round(safe(r.get("dividendYielTTM"), 0) * 100, 2)
-            payout        = round(safe(r.get("payoutRatioTTM"), 0) * 100, 2)
-            fcf_raw       = safe(r.get("freeCashFlowPerShareTTM"))
-    except Exception:
-        pass
+    ratios = fmp_get(f"ratios/{ticker}", {"period": "annual", "limit": 1})
+    if ratios and isinstance(ratios, list) and len(ratios) > 0:
+        r = ratios[0]
+        pe            = safe(r.get("priceEarningsRatio"))
+        forward_pe    = safe(r.get("priceEarningsRatio"))
+        pb            = safe(r.get("priceToBookRatio"))
+        ps            = safe(r.get("priceToSalesRatio"))
+        ev_ebitda     = safe(r.get("enterpriseValueMultiple"))
+        peg           = safe(r.get("priceEarningsToGrowthRatio"))
+        roe_r         = safe(r.get("returnOnEquity"))
+        roa_r         = safe(r.get("returnOnAssets"))
+        nm_r          = safe(r.get("netProfitMargin"))
+        gm_r          = safe(r.get("grossProfitMargin"))
+        om_r          = safe(r.get("operatingProfitMargin"))
+        roe           = round(roe_r * 100, 2) if roe_r is not None else None
+        roa           = round(roa_r * 100, 2) if roa_r is not None else None
+        net_margin    = round(nm_r  * 100, 2) if nm_r  is not None else None
+        gross_margin  = round(gm_r  * 100, 2) if gm_r  is not None else None
+        op_margin     = round(om_r  * 100, 2) if om_r  is not None else None
+        debt_eq       = safe(r.get("debtEquityRatio"))
+        current_ratio = safe(r.get("currentRatio"))
+        dy_r          = safe(r.get("dividendYield"))
+        div_yield     = round(dy_r * 100, 2) if dy_r is not None else None
+        pr_r          = safe(r.get("payoutRatio"))
+        payout        = round(pr_r * 100, 2) if pr_r is not None else None
 
-    # Croissance — FMP income statement growth
-    try:
-        r_growth = requests.get(
-            f"{FMP_BASE}/income-statement-growth/{ticker}",
-            params={"limit": 1, "apikey": FMP_KEY},
-            headers=HEADERS, timeout=15
-        )
-        growth_data = r_growth.json()
-        if growth_data and isinstance(growth_data, list):
-            g = growth_data[0]
-            rev_growth = round(safe(g.get("growthRevenue"), 0) * 100, 2)
-            eps_growth = round(safe(g.get("growthEPS"), 0) * 100, 2)
-    except Exception:
-        pass
+    # Croissance
+    growth = fmp_get(f"income-statement-growth/{ticker}", {"limit": 1})
+    if growth and isinstance(growth, list) and len(growth) > 0:
+        g = growth[0]
+        rg = safe(g.get("growthRevenue"))
+        eg = safe(g.get("growthEPS"))
+        rev_growth = round(rg * 100, 2) if rg is not None else None
+        eps_growth = round(eg * 100, 2) if eg is not None else None
 
-    # Dividende
-    try:
-        r_div = requests.get(
-            f"{FMP_BASE}/stock_dividend_history/{ticker}",
-            params={"apikey": FMP_KEY},
-            headers=HEADERS, timeout=10
-        )
-        divs = r_div.json()
-        if divs and isinstance(divs, list) and len(divs) > 0:
-            div_rate = round(sum(safe(d.get("dividend"), 0) for d in divs[:4]), 2)
-    except Exception:
-        pass
+    # Key metrics (FCF yield, market cap affiné)
+    km = fmp_get(f"key-metrics/{ticker}", {"limit": 1})
+    if km and isinstance(km, list) and len(km) > 0:
+        k = km[0]
+        market_cap = safe(k.get("marketCap")) or market_cap
+        fcy = safe(k.get("freeCashFlowYield"))
+        fcf_yield = round(fcy * 100, 2) if fcy is not None else None
+        div_rate  = safe(k.get("dividendPerShare")) or div_rate
 
-    # Actionnariat
-    try:
-        r_inst = requests.get(
-            f"{FMP_BASE}/institutional-holder/{ticker}",
-            params={"apikey": FMP_KEY},
-            headers=HEADERS, timeout=10
-        )
-        inst_data = r_inst.json()
-        if inst_data and isinstance(inst_data, list):
-            total_shares = sum(safe(h.get("shares"), 0) for h in inst_data[:20])
-            if market_cap and price and total_shares:
-                institution = round(total_shares * price / market_cap * 100, 1)
-    except Exception:
-        pass
+    # ── 5. CONSENSUS — FMP stable ─────────────────
+    cons_note="Hold"; num_ana=None; tgt=None; tgt_h=None; tgt_l=None
 
-    # ─────────────────────────────────────────────
-    # 5. CONSENSUS ANALYSTES — FMP
-    # ─────────────────────────────────────────────
-    cons_note = "Hold"; num_ana = None; tgt = None; tgt_h = None; tgt_l = None
+    pt = fmp_get(f"price-target-summary/{ticker}")
+    if pt and isinstance(pt, list) and len(pt) > 0:
+        tgt   = safe(pt[0].get("targetConsensus"))
+        tgt_h = safe(pt[0].get("targetHigh"))
+        tgt_l = safe(pt[0].get("targetLow"))
+        num_ana = safe(pt[0].get("numberOfAnalysts"))
 
-    try:
-        r_price_tgt = requests.get(
-            f"{FMP_BASE}/price-target-consensus/{ticker}",
-            params={"apikey": FMP_KEY},
-            headers=HEADERS, timeout=15
-        )
-        pt = r_price_tgt.json()
-        if pt and isinstance(pt, list) and len(pt) > 0:
-            tgt   = safe(pt[0].get("targetConsensus"))
-            tgt_h = safe(pt[0].get("targetHigh"))
-            tgt_l = safe(pt[0].get("targetLow"))
-    except Exception:
-        pass
+    ratings = fmp_get(f"analyst-stock-recommendations/{ticker}", {"limit": 20})
+    if ratings and isinstance(ratings, list) and len(ratings) > 0:
+        buy  = sum(1 for r in ratings if "buy" in str(r.get("newGrade","")).lower())
+        hold = sum(1 for r in ratings if "hold" in str(r.get("newGrade","")).lower() or "neutral" in str(r.get("newGrade","")).lower())
+        sell = sum(1 for r in ratings if "sell" in str(r.get("newGrade","")).lower() or "reduce" in str(r.get("newGrade","")).lower())
+        total = buy + hold + sell
+        num_ana = num_ana or total
+        if total > 0:
+            score = (buy*1.5 + hold*3 + sell*4.5) / total
+            cons_note = consensus_label(score)
 
-    try:
-        r_rating = requests.get(
-            f"{FMP_BASE}/analyst-stock-recommendations/{ticker}",
-            params={"limit": 10, "apikey": FMP_KEY},
-            headers=HEADERS, timeout=15
-        )
-        ratings = r_rating.json()
-        if ratings and isinstance(ratings, list):
-            buy_count  = sum(1 for r in ratings if "buy" in str(r.get("newGrade","")).lower())
-            hold_count = sum(1 for r in ratings if "hold" in str(r.get("newGrade","")).lower() or "neutral" in str(r.get("newGrade","")).lower())
-            sell_count = sum(1 for r in ratings if "sell" in str(r.get("newGrade","")).lower() or "reduce" in str(r.get("newGrade","")).lower())
-            num_ana    = len(ratings)
-            total      = buy_count + hold_count + sell_count
-            if total > 0:
-                score = (buy_count * 1.5 + hold_count * 3 + sell_count * 4.5) / total
-                cons_note = consensus_from_score(score)
-    except Exception:
-        pass
-
-    upside = round((tgt / price - 1) * 100, 2) if tgt and price and price > 0 else None
-
-    # Forward PE via FMP key metrics
-    try:
-        r_km = requests.get(
-            f"{FMP_BASE}/key-metrics-ttm/{ticker}",
-            params={"apikey": FMP_KEY},
-            headers=HEADERS, timeout=15
-        )
-        km = r_km.json()
-        if km and isinstance(km, list):
-            forward_pe  = safe(km[0].get("peRatioTTM")) if not pe else forward_pe
-            market_cap  = safe(km[0].get("marketCapTTM")) or market_cap
-            ev_ebitda   = safe(km[0].get("evToEbitdaTTM")) or ev_ebitda
-            fcf_yield   = round(safe(km[0].get("freeCashFlowYieldTTM"), 0) * 100, 2)
-    except Exception:
-        pass
+    upside = round((tgt/price - 1)*100, 2) if tgt and price and price > 0 else None
 
     return JSONResponse(content={
         "ticker":               ticker,
@@ -330,7 +263,7 @@ def get_stock(ticker: str):
         "dividendRate":         div_rate,
         "dividendYield":        div_yield,
         "payoutRatio":          payout,
-        "beta":                 beta_fmp,
+        "beta":                 beta,
         "rsi":                  rsi,
         "ma200":                ma200,
         "ma50":                 ma50,
@@ -339,7 +272,7 @@ def get_stock(ticker: str):
         "avgVolume":            None,
         "shortRatio":           None,
         "consensusNote":        cons_note,
-        "numAnalysts":          num_ana,
+        "numAnalysts":          int(num_ana) if num_ana else None,
         "recommendationKey":    cons_note.lower().replace(" ", ""),
         "insiderOwnership":     insider,
         "institutionOwnership": institution,
