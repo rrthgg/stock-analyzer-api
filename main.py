@@ -60,20 +60,19 @@ def root():
 
 @app.get("/stock/{ticker}")
 def get_stock(ticker: str):
-    """
-    Retourne les données fondamentales, techniques et consensus d'un ticker.
-    Compatible US (AAPL, NVDA…) et EU (MC.PA, AIR.PA, ASML.AS…)
-    """
     ticker = ticker.upper().strip()
     try:
         t = yf.Ticker(ticker)
         info = t.info
 
-        # Vérification que le ticker existe
-        if not info or info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
-            raise HTTPException(status_code=404, detail=f"Ticker '{ticker}' introuvable ou non supporté.")
+        if not info or len(info) < 5:
+            raise HTTPException(status_code=404, detail=f"Ticker '{ticker}' introuvable. Vérifiez le suffixe (ex: SAP.DE, MC.PA, ASML.AS)")
 
-        price = safe(info.get("currentPrice") or info.get("regularMarketPrice"))
+        price = safe(info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"))
+
+        if not price:
+            raise HTTPException(status_code=404, detail=f"Aucun cours disponible pour '{ticker}'.")
+
         tgt   = safe(info.get("targetMeanPrice"))
         tgt_h = safe(info.get("targetHighPrice"))
         tgt_l = safe(info.get("targetLowPrice"))
@@ -82,10 +81,14 @@ def get_stock(ticker: str):
         if price and tgt and price > 0:
             upside = round((tgt / price - 1) * 100, 2)
 
-        # Historique 1 an pour MM200 / MM50
-        hist = t.history(period="1y")
+        hist = None
         ma200 = ma50 = None
-        if not hist.empty and "Close" in hist.columns:
+        try:
+            hist = t.history(period="1y")
+        except Exception:
+            hist = None
+
+        if hist is not None and not hist.empty and "Close" in hist.columns:
             closes = hist["Close"]
             if len(closes) >= 200:
                 ma200 = round(float(closes.tail(200).mean()), 2)
@@ -99,41 +102,26 @@ def get_stock(ticker: str):
         ma200_signal = 1 if (price and ma200 and price > ma200) else -1
         ma50_signal  = 1 if (price and ma50  and price > ma50)  else -1
 
-        # RSI simplifié sur 14 jours
         rsi = None
-        if not hist.empty and len(hist) >= 15:
-            delta = hist["Close"].diff()
-            gains = delta.clip(lower=0).tail(14)
-            losses = (-delta.clip(upper=0)).tail(14)
-            avg_gain = gains.mean()
-            avg_loss = losses.mean()
-            if avg_loss and avg_loss != 0:
-                rs = avg_gain / avg_loss
-                rsi = round(100 - (100 / (1 + rs)), 1)
-
-        # Récupération des recommandations analystes
         try:
-            recs = t.recommendations
-            if recs is not None and not recs.empty:
-                recent = recs.tail(1)
-                cons_note = consensus_label(recent.get("To Grade", recent.get("Action", pd.Series(["hold"]))).iloc[0])
-            else:
-                cons_note = consensus_label(info.get("recommendationKey"))
+            if hist is not None and not hist.empty and len(hist) >= 15:
+                delta = hist["Close"].diff()
+                gains  = delta.clip(lower=0).tail(14)
+                losses = (-delta.clip(upper=0)).tail(14)
+                avg_gain = gains.mean()
+                avg_loss = losses.mean()
+                if avg_loss and avg_loss != 0:
+                    rs = avg_gain / avg_loss
+                    rsi = round(100 - (100 / (1 + rs)), 1)
         except Exception:
-            cons_note = consensus_label(info.get("recommendationKey"))
+            rsi = None
 
-        # Données peers (limité — Yahoo ne fournit pas nativement les peers)
-        peers_raw = []
-        try:
-            peers_raw = info.get("industryPeers", []) or []
-        except Exception:
-            peers_raw = []
+        cons_note = consensus_label(info.get("recommendationKey"))
 
         result = {
-            # Identification
             "ticker":    ticker,
             "name":      info.get("longName") or info.get("shortName", ticker),
-            "sector":    info.get("sector", "—"),
+            "sector":    info.get("sector") or info.get("quoteType", "—"),
             "industry":  info.get("industry", "—"),
             "country":   info.get("country", "—"),
             "currency":  info.get("currency", "USD"),
@@ -141,16 +129,14 @@ def get_stock(ticker: str):
             "website":   info.get("website"),
             "summary":   (info.get("longBusinessSummary") or "")[:400],
 
-            # Prix & objectif
-            "price":       round(price, 2) if price else None,
+            "price":        round(price, 2) if price else None,
             "price52wHigh": safe(info.get("fiftyTwoWeekHigh")),
             "price52wLow":  safe(info.get("fiftyTwoWeekLow")),
-            "targetMean":  round(tgt, 2) if tgt else None,
-            "targetHigh":  round(tgt_h, 2) if tgt_h else None,
-            "targetLow":   round(tgt_l, 2) if tgt_l else None,
-            "upside":      upside,
+            "targetMean":   round(tgt, 2) if tgt else None,
+            "targetHigh":   round(tgt_h, 2) if tgt_h else None,
+            "targetLow":    round(tgt_l, 2) if tgt_l else None,
+            "upside":       upside,
 
-            # Valorisation
             "pe":          safe(info.get("trailingPE")),
             "forwardPE":   safe(info.get("forwardPE")),
             "pb":          safe(info.get("priceToBook")),
@@ -160,7 +146,6 @@ def get_stock(ticker: str):
             "peg":         safe(info.get("pegRatio")),
             "marketCap":   safe(info.get("marketCap")),
 
-            # Rentabilité & croissance
             "roe":         pct(info.get("returnOnEquity")),
             "roa":         pct(info.get("returnOnAssets")),
             "netMargin":   pct(info.get("profitMargins")),
@@ -168,40 +153,34 @@ def get_stock(ticker: str):
             "opMargin":    pct(info.get("operatingMargins")),
             "revGrowth":   pct(info.get("revenueGrowth")),
             "epsGrowth":   pct(info.get("earningsGrowth")),
-            "revenueYoY":  safe(info.get("totalRevenue")),
             "fcfYield":    pct(info.get("freeCashflow") / info.get("marketCap"))
                            if info.get("freeCashflow") and info.get("marketCap") else None,
 
-            # Bilan
-            "debtEquity":  safe(info.get("debtToEquity")),
+            "debtEquity":   safe(info.get("debtToEquity")),
             "currentRatio": safe(info.get("currentRatio")),
             "cashPerShare": safe(info.get("totalCashPerShare")),
 
-            # Dividende
-            "dividendRate":  safe(info.get("dividendRate")),
-            "dividendYield": pct(info.get("dividendYield")),
-            "payoutRatio":   pct(info.get("payoutRatio")),
+            "dividendRate":   safe(info.get("dividendRate")),
+            "dividendYield":  pct(info.get("dividendYield")),
+            "payoutRatio":    pct(info.get("payoutRatio")),
 
-            # Technique
-            "beta":       safe(info.get("beta")),
-            "rsi":        rsi,
-            "ma200":      ma200,
-            "ma50":       ma50,
-            "ma200Signal": ma200_signal,
-            "ma50Signal":  ma50_signal,
-            "avgVolume":   safe(info.get("averageVolume")),
-            "shortRatio":  safe(info.get("shortRatio")),
+            "beta":         safe(info.get("beta")),
+            "rsi":          rsi,
+            "ma200":        ma200,
+            "ma50":         ma50,
+            "ma200Signal":  ma200_signal,
+            "ma50Signal":   ma50_signal,
+            "avgVolume":    safe(info.get("averageVolume")),
+            "shortRatio":   safe(info.get("shortRatio")),
 
-            # Consensus
-            "consensusNote":      cons_note,
-            "numAnalysts":        safe(info.get("numberOfAnalystOpinions")),
-            "recommendationKey":  info.get("recommendationKey", "hold"),
+            "consensusNote":        cons_note,
+            "numAnalysts":          safe(info.get("numberOfAnalystOpinions")),
+            "recommendationKey":    info.get("recommendationKey", "hold"),
 
-            # Actionnariat
-            "insiderOwnership":   pct(info.get("heldPercentInsiders")),
+            "insiderOwnership":     pct(info.get("heldPercentInsiders")),
             "institutionOwnership": pct(info.get("heldPercentInstitutions")),
 
-            "peers": peers_raw[:5] if peers_raw else [],
+            "peers": [],
         }
 
         return JSONResponse(content=result)
