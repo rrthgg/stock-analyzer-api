@@ -1,14 +1,15 @@
 """
-Stock Analyzer API — Alpha Vantage (cours) + FMP v4 (fondamentaux)
-Endpoints FMP mis à jour post-août 2025
+Stock Analyzer API — Alpha Vantage uniquement
+GLOBAL_QUOTE  : cours temps réel
+OVERVIEW      : tous les fondamentaux (PER, marges, ROE, consensus, objectif)
+TIME_SERIES_DAILY : historique pour MM50, MM200, RSI
+= 3 appels par ticker, plan gratuit 25/jour
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import requests
-import math
-import os
+import requests, math, os
 
 app = FastAPI()
 app.add_middleware(
@@ -18,16 +19,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-AV_KEY  = os.environ.get("AV_KEY",  "")
-FMP_KEY = os.environ.get("FMP_KEY", "")
-
-AV_BASE  = "https://www.alphavantage.co/query"
-FMP_BASE = "https://financialmodelingprep.com/stable"
-
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)"}
+AV_KEY = os.environ.get("AV_KEY", "")
+BASE   = "https://www.alphavantage.co/query"
+HDR    = {"User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)"}
 
 def safe(v, default=None):
-    if v is None or v == "" or v == "N/A" or v == "-":
+    if v is None or str(v).strip() in ("", "None", "-", "N/A", "0.0000"):
         return default
     try:
         f = float(v)
@@ -39,30 +36,32 @@ def pct(v):
     f = safe(v)
     return round(f * 100, 2) if f is not None else None
 
-def consensus_label(score):
-    if score is None: return "Hold"
-    s = float(score)
-    if s <= 1.5: return "Strong Buy"
-    if s <= 2.5: return "Buy"
-    if s <= 3.5: return "Hold"
-    return "Reduce"
-
-def fmp_get(path, params={}):
-    """Appel FMP avec gestion d'erreur."""
+def av(function, symbol, extra={}):
     try:
-        r = requests.get(
-            f"{FMP_BASE}/{path}",
-            params={"apikey": FMP_KEY, **params},
-            headers=HEADERS, timeout=15
-        )
-        data = r.json()
-        if isinstance(data, dict) and "Error Message" in data:
-            return None
-        if isinstance(data, dict) and "message" in data:
-            return None
-        return data
+        r = requests.get(BASE, params={"function": function, "symbol": symbol, "apikey": AV_KEY, **extra}, headers=HDR, timeout=15)
+        d = r.json()
+        if "Information" in d or "Note" in d:
+            return None  # rate limit atteint
+        return d
     except Exception:
         return None
+
+def consensus_from_av(ov):
+    """Reconstruit le consensus depuis les comptages analystes AV."""
+    sb  = safe(ov.get("AnalystRatingStrongBuy"),  0)
+    b   = safe(ov.get("AnalystRatingBuy"),         0)
+    h   = safe(ov.get("AnalystRatingHold"),        0)
+    s   = safe(ov.get("AnalystRatingSell"),         0)
+    ss  = safe(ov.get("AnalystRatingStrongSell"),  0)
+    total = (sb or 0) + (b or 0) + (h or 0) + (s or 0) + (ss or 0)
+    if total == 0:
+        return "Hold", None
+    score = ((sb or 0)*1 + (b or 0)*2 + (h or 0)*3 + (s or 0)*4 + (ss or 0)*5) / total
+    if score <= 1.5: label = "Strong Buy"
+    elif score <= 2.5: label = "Buy"
+    elif score <= 3.5: label = "Hold"
+    else: label = "Reduce"
+    return label, int(total)
 
 @app.get("/")
 def root():
@@ -72,158 +71,87 @@ def root():
 def get_stock(ticker: str):
     ticker = ticker.upper().strip()
 
-    # ── 1. COURS — Alpha Vantage ──────────────────
-    try:
-        r_q = requests.get(AV_BASE, params={
-            "function": "GLOBAL_QUOTE",
-            "symbol":   ticker,
-            "apikey":   AV_KEY,
-        }, headers=HEADERS, timeout=15)
-        q = r_q.json().get("Global Quote", {})
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Erreur réseau : {str(e)}")
-
+    # ── 1. COURS ──────────────────────────────────
+    q_data = av("GLOBAL_QUOTE", ticker)
+    if not q_data:
+        raise HTTPException(status_code=503, detail="Limite Alpha Vantage atteinte (25/jour). Réessayez demain ou utilisez une 2ème clé.")
+    q = q_data.get("Global Quote", {})
     price = safe(q.get("05. price"))
     if not price:
-        raise HTTPException(
-            status_code=404,
-            detail=f"'{ticker}' introuvable. EU : MC.PAR, AIR.PAR, ASML.AMS, SAP.FRK, TTE.PAR"
-        )
+        raise HTTPException(status_code=404, detail=f"'{ticker}' introuvable. Exemples EU : MC.PAR · AIR.PAR · ASML.AMS · SAP.FRK · TTE.PAR · BNP.PAR")
 
-    hi52_av = safe(q.get("03. high"))
-    lo52_av = safe(q.get("04. low"))
+    hi52_q = safe(q.get("03. high"))
+    lo52_q = safe(q.get("04. low"))
+    vol    = safe(q.get("06. volume"))
 
-    # ── 2. HISTORIQUE — Alpha Vantage (MM + RSI) ──
+    # ── 2. FONDAMENTAUX (OVERVIEW) ────────────────
+    ov = av("OVERVIEW", ticker) or {}
+
+    name         = ov.get("Name") or ticker
+    sector       = ov.get("Sector")   or "—"
+    industry     = ov.get("Industry") or "—"
+    country      = ov.get("Country")  or "—"
+    currency     = ov.get("Currency") or "USD"
+    exchange     = ov.get("Exchange") or "—"
+    summary      = (ov.get("Description") or "")[:400]
+    market_cap   = safe(ov.get("MarketCapitalization"))
+    beta         = safe(ov.get("Beta"))
+    pe           = safe(ov.get("TrailingPE"))
+    forward_pe   = safe(ov.get("ForwardPE"))
+    pb           = safe(ov.get("PriceToBookRatio"))
+    ps           = safe(ov.get("PriceToSalesRatioTTM"))
+    ev_ebitda    = safe(ov.get("EVToEBITDA"))
+    peg          = safe(ov.get("PEGRatio"))
+    tgt          = safe(ov.get("AnalystTargetPrice"))
+    hi52         = safe(ov.get("52WeekHigh"))  or hi52_q
+    lo52         = safe(ov.get("52WeekLow"))   or lo52_q
+    roe          = pct(ov.get("ReturnOnEquityTTM"))
+    roa          = pct(ov.get("ReturnOnAssetsTTM"))
+    net_margin   = pct(ov.get("ProfitMargin"))
+    op_margin    = pct(ov.get("OperatingMarginTTM"))
+    rev_growth   = pct(ov.get("QuarterlyRevenueGrowthYOY"))
+    eps_growth   = pct(ov.get("QuarterlyEarningsGrowthYOY"))
+    debt_eq      = safe(ov.get("DebtToEquityRatio"))
+    div_rate     = safe(ov.get("DividendPerShare"))
+    div_yield_r  = safe(ov.get("DividendYield"))
+    div_yield    = round(div_yield_r * 100, 2) if div_yield_r else None
+    payout_r     = safe(ov.get("PayoutRatio"))
+    payout       = round(payout_r * 100, 2) if payout_r else None
+    insider      = pct(ov.get("PercentInsiders"))
+    institution  = pct(ov.get("PercentInstitutions"))
+
+    cons_note, num_ana = consensus_from_av(ov)
+    upside = round((tgt/price - 1)*100, 2) if tgt and price and price > 0 else None
+
+    # FCF yield approx
+    fcf_yield = None
+    fcf = safe(ov.get("OperatingCashflowTTM"))
+    capex = safe(ov.get("CapitalExpenditures"))
+    if fcf and capex and market_cap and market_cap > 0:
+        fcf_yield = round((fcf - abs(capex)) / market_cap * 100, 2)
+
+    # ── 3. HISTORIQUE → MM50, MM200, RSI ─────────
     closes = []
-    try:
-        r_h = requests.get(AV_BASE, params={
-            "function":   "TIME_SERIES_DAILY",
-            "symbol":     ticker,
-            "outputsize": "compact",
-            "apikey":     AV_KEY,
-        }, headers=HEADERS, timeout=15)
-        series = r_h.json().get("Time Series (Daily)", {})
-        closes = [float(v["4. close"]) for v in list(series.values())[:200]]
-    except Exception:
-        closes = []
+    h_data = av("TIME_SERIES_DAILY", ticker, {"outputsize": "compact"})
+    if h_data:
+        series = h_data.get("Time Series (Daily)", {})
+        closes = [float(v["4. close"]) for v in list(series.values())[:200] if v.get("4. close")]
 
-    ma200 = round(sum(closes)/len(closes), 2)     if len(closes) >= 100 else None
-    ma50  = round(sum(closes[:50])/50, 2)          if len(closes) >= 50  else None
-    ma200_signal = 1 if (price and ma200 and price > ma200) else -1
-    ma50_signal  = 1 if (price and ma50  and price > ma50)  else -1
+    ma200 = round(sum(closes)/len(closes), 2)   if len(closes) >= 100 else None
+    ma50  = round(sum(closes[:50])/50, 2)        if len(closes) >= 50  else None
+    ma200_sig = 1 if (price and ma200 and price > ma200) else -1
+    ma50_sig  = 1 if (price and ma50  and price > ma50)  else -1
 
     rsi = None
     if len(closes) >= 15:
         try:
             deltas = [closes[i]-closes[i+1] for i in range(14)]
-            gains  = [d if d>0 else 0 for d in deltas]
-            losses = [-d if d<0 else 0 for d in deltas]
-            ag, al = sum(gains)/14, sum(losses)/14
+            ag = sum(d for d in deltas if d > 0) / 14
+            al = sum(-d for d in deltas if d < 0) / 14
             if al > 0:
                 rsi = round(100 - 100/(1 + ag/al), 1)
         except Exception:
             rsi = None
-
-    # ── 3. PROFIL — FMP stable endpoint ───────────
-    name=ticker; sector="—"; industry="—"; country="—"
-    currency="USD"; exchange="—"; summary=""; website=None
-    market_cap=None; beta=None; hi52=hi52_av; lo52=lo52_av
-
-    profile = fmp_get(f"profile/{ticker}")
-    if profile and isinstance(profile, list) and len(profile) > 0:
-        p = profile[0]
-        name       = p.get("companyName") or ticker
-        sector     = p.get("sector")   or "—"
-        industry   = p.get("industry") or "—"
-        country    = p.get("country")  or "—"
-        currency   = p.get("currency") or "USD"
-        exchange   = p.get("exchangeShortName") or "—"
-        summary    = (p.get("description") or "")[:400]
-        website    = p.get("website")
-        market_cap = safe(p.get("mktCap"))
-        beta       = safe(p.get("beta"))
-        price_fmp  = safe(p.get("price"))
-        if price_fmp and not price:
-            price = price_fmp
-        rng = str(p.get("range") or "")
-        if "-" in rng:
-            parts = rng.split("-")
-            lo52 = safe(parts[0]) or lo52_av
-            hi52 = safe(parts[-1]) or hi52_av
-
-    # ── 4. RATIOS — FMP stable ────────────────────
-    pe=pb=ps=ev_ebitda=peg=forward_pe=None
-    roe=roa=net_margin=gross_margin=op_margin=None
-    rev_growth=eps_growth=debt_eq=current_ratio=None
-    div_rate=div_yield=payout=fcf_yield=None
-    insider=institution=None
-
-    ratios = fmp_get(f"ratios/{ticker}", {"period": "annual", "limit": 1})
-    if ratios and isinstance(ratios, list) and len(ratios) > 0:
-        r = ratios[0]
-        pe            = safe(r.get("priceEarningsRatio"))
-        forward_pe    = safe(r.get("priceEarningsRatio"))
-        pb            = safe(r.get("priceToBookRatio"))
-        ps            = safe(r.get("priceToSalesRatio"))
-        ev_ebitda     = safe(r.get("enterpriseValueMultiple"))
-        peg           = safe(r.get("priceEarningsToGrowthRatio"))
-        roe_r         = safe(r.get("returnOnEquity"))
-        roa_r         = safe(r.get("returnOnAssets"))
-        nm_r          = safe(r.get("netProfitMargin"))
-        gm_r          = safe(r.get("grossProfitMargin"))
-        om_r          = safe(r.get("operatingProfitMargin"))
-        roe           = round(roe_r * 100, 2) if roe_r is not None else None
-        roa           = round(roa_r * 100, 2) if roa_r is not None else None
-        net_margin    = round(nm_r  * 100, 2) if nm_r  is not None else None
-        gross_margin  = round(gm_r  * 100, 2) if gm_r  is not None else None
-        op_margin     = round(om_r  * 100, 2) if om_r  is not None else None
-        debt_eq       = safe(r.get("debtEquityRatio"))
-        current_ratio = safe(r.get("currentRatio"))
-        dy_r          = safe(r.get("dividendYield"))
-        div_yield     = round(dy_r * 100, 2) if dy_r is not None else None
-        pr_r          = safe(r.get("payoutRatio"))
-        payout        = round(pr_r * 100, 2) if pr_r is not None else None
-
-    # Croissance
-    growth = fmp_get(f"income-statement-growth/{ticker}", {"limit": 1})
-    if growth and isinstance(growth, list) and len(growth) > 0:
-        g = growth[0]
-        rg = safe(g.get("growthRevenue"))
-        eg = safe(g.get("growthEPS"))
-        rev_growth = round(rg * 100, 2) if rg is not None else None
-        eps_growth = round(eg * 100, 2) if eg is not None else None
-
-    # Key metrics (FCF yield, market cap affiné)
-    km = fmp_get(f"key-metrics/{ticker}", {"limit": 1})
-    if km and isinstance(km, list) and len(km) > 0:
-        k = km[0]
-        market_cap = safe(k.get("marketCap")) or market_cap
-        fcy = safe(k.get("freeCashFlowYield"))
-        fcf_yield = round(fcy * 100, 2) if fcy is not None else None
-        div_rate  = safe(k.get("dividendPerShare")) or div_rate
-
-    # ── 5. CONSENSUS — FMP stable ─────────────────
-    cons_note="Hold"; num_ana=None; tgt=None; tgt_h=None; tgt_l=None
-
-    pt = fmp_get(f"price-target-summary/{ticker}")
-    if pt and isinstance(pt, list) and len(pt) > 0:
-        tgt   = safe(pt[0].get("targetConsensus"))
-        tgt_h = safe(pt[0].get("targetHigh"))
-        tgt_l = safe(pt[0].get("targetLow"))
-        num_ana = safe(pt[0].get("numberOfAnalysts"))
-
-    ratings = fmp_get(f"analyst-stock-recommendations/{ticker}", {"limit": 20})
-    if ratings and isinstance(ratings, list) and len(ratings) > 0:
-        buy  = sum(1 for r in ratings if "buy" in str(r.get("newGrade","")).lower())
-        hold = sum(1 for r in ratings if "hold" in str(r.get("newGrade","")).lower() or "neutral" in str(r.get("newGrade","")).lower())
-        sell = sum(1 for r in ratings if "sell" in str(r.get("newGrade","")).lower() or "reduce" in str(r.get("newGrade","")).lower())
-        total = buy + hold + sell
-        num_ana = num_ana or total
-        if total > 0:
-            score = (buy*1.5 + hold*3 + sell*4.5) / total
-            cons_note = consensus_label(score)
-
-    upside = round((tgt/price - 1)*100, 2) if tgt and price and price > 0 else None
 
     return JSONResponse(content={
         "ticker":               ticker,
@@ -234,13 +162,13 @@ def get_stock(ticker: str):
         "currency":             currency,
         "exchange":             exchange,
         "summary":              summary,
-        "website":              website,
+        "website":              None,
         "price":                round(price, 2),
         "price52wHigh":         hi52,
         "price52wLow":          lo52,
         "targetMean":           tgt,
-        "targetHigh":           tgt_h,
-        "targetLow":            tgt_l,
+        "targetHigh":           None,
+        "targetLow":            None,
         "upside":               upside,
         "pe":                   pe,
         "forwardPE":            forward_pe,
@@ -252,13 +180,13 @@ def get_stock(ticker: str):
         "roe":                  roe,
         "roa":                  roa,
         "netMargin":            net_margin,
-        "grossMargin":          gross_margin,
+        "grossMargin":          None,
         "opMargin":             op_margin,
         "revGrowth":            rev_growth,
         "epsGrowth":            eps_growth,
         "fcfYield":             fcf_yield,
         "debtEquity":           debt_eq,
-        "currentRatio":         current_ratio,
+        "currentRatio":         None,
         "cashPerShare":         None,
         "dividendRate":         div_rate,
         "dividendYield":        div_yield,
@@ -267,12 +195,12 @@ def get_stock(ticker: str):
         "rsi":                  rsi,
         "ma200":                ma200,
         "ma50":                 ma50,
-        "ma200Signal":          ma200_signal,
-        "ma50Signal":           ma50_signal,
-        "avgVolume":            None,
+        "ma200Signal":          ma200_sig,
+        "ma50Signal":           ma50_sig,
+        "avgVolume":            vol,
         "shortRatio":           None,
         "consensusNote":        cons_note,
-        "numAnalysts":          int(num_ana) if num_ana else None,
+        "numAnalysts":          num_ana,
         "recommendationKey":    cons_note.lower().replace(" ", ""),
         "insiderOwnership":     insider,
         "institutionOwnership": institution,
